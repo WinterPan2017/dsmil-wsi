@@ -12,23 +12,19 @@ from sklearn.utils import shuffle
 from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_fscore_support
 from sklearn.datasets import load_svmlight_file
 from collections import OrderedDict
+import json
+from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, accuracy_score, roc_curve
 
-def get_bag_feats(csv_file_df, args):
-    if args.dataset == 'TCGA-lung-default':
-        feats_csv_path = 'datasets/tcga-dataset/tcga_lung_data_feats/' + csv_file_df.iloc[0].split('/')[1] + '.csv'
-    else:
-        feats_csv_path = csv_file_df.iloc[0]
-    df = pd.read_csv(feats_csv_path)
-    feats = shuffle(df).reset_index(drop=True)
-    feats = feats.to_numpy()
-    label = np.zeros(args.num_classes)
-    if args.num_classes==1:
-        label[0] = csv_file_df.iloc[1]
-    else:
-        if int(csv_file_df.iloc[1])<=(len(label)-1):
-            label[int(csv_file_df.iloc[1])] = 1
-        
-    return label, feats
+def print_log(tstr, f):
+    f.write('\n')
+    f.write(tstr)
+    f.flush()
+    print(tstr)
+
+def get_bag_feats(csv_file_df, args): # modify for unified dataset
+    feature = np.load(csv_file_df.iloc[0])["features"]
+    label = csv_file_df.iloc[1]
+    return np.array([label]), feature
 
 def train(train_df, milnet, criterion, optimizer, args):
     milnet.train()
@@ -40,8 +36,8 @@ def train(train_df, milnet, criterion, optimizer, args):
         optimizer.zero_grad()
         label, feats = get_bag_feats(train_df.iloc[i], args)
         feats = dropout_patches(feats, args.dropout_patch)
-        bag_label = Variable(Tensor([label]))
-        bag_feats = Variable(Tensor([feats]))
+        bag_label = torch.from_numpy(label).cuda().float()
+        bag_feats = torch.from_numpy(feats).cuda().float()
         bag_feats = bag_feats.view(-1, args.feats_size)
         ins_prediction, bag_prediction, _, _ = milnet(bag_feats)
         max_prediction, _ = torch.max(ins_prediction, 0)        
@@ -62,7 +58,7 @@ def dropout_patches(feats, p):
     sampled_feats = np.concatenate((sampled_feats, pad_feats), axis=0)
     return sampled_feats
 
-def test(test_df, milnet, criterion, args):
+def test(test_df, milnet, criterion, args): # modified for unified eval metrics
     milnet.eval()
     csvs = shuffle(test_df).reset_index(drop=True)
     total_loss = 0
@@ -72,8 +68,8 @@ def test(test_df, milnet, criterion, args):
     with torch.no_grad():
         for i in range(len(test_df)):
             label, feats = get_bag_feats(test_df.iloc[i], args)
-            bag_label = Variable(Tensor([label]))
-            bag_feats = Variable(Tensor([feats]))
+            bag_label = torch.from_numpy(label).cuda().float()
+            bag_feats = torch.from_numpy(feats).cuda().float()
             bag_feats = bag_feats.view(-1, args.feats_size)
             ins_prediction, bag_prediction, _, _ = milnet(bag_feats)
             max_prediction, _ = torch.max(ins_prediction, 0)  
@@ -86,56 +82,24 @@ def test(test_df, milnet, criterion, args):
             if args.average:
                 test_predictions.extend([(0.5*torch.sigmoid(max_prediction)+0.5*torch.sigmoid(bag_prediction)).squeeze().cpu().numpy()])
             else: test_predictions.extend([(0.0*torch.sigmoid(max_prediction)+1.0*torch.sigmoid(bag_prediction)).squeeze().cpu().numpy()])
-    test_labels = np.array(test_labels)
-    test_predictions = np.array(test_predictions)
-    auc_value, _, thresholds_optimal = multi_label_roc(test_labels, test_predictions, args.num_classes, pos_label=1)
-    if args.num_classes==1:
-        class_prediction_bag = copy.deepcopy(test_predictions)
-        class_prediction_bag[test_predictions>=thresholds_optimal[0]] = 1
-        class_prediction_bag[test_predictions<thresholds_optimal[0]] = 0
-        test_predictions = class_prediction_bag
-        test_labels = np.squeeze(test_labels)
-    else:        
-        for i in range(args.num_classes):
-            class_prediction_bag = copy.deepcopy(test_predictions[:, i])
-            class_prediction_bag[test_predictions[:, i]>=thresholds_optimal[i]] = 1
-            class_prediction_bag[test_predictions[:, i]<thresholds_optimal[i]] = 0
-            test_predictions[:, i] = class_prediction_bag
-    bag_score = 0
-    for i in range(0, len(test_df)):
-        bag_score = np.array_equal(test_labels[i], test_predictions[i]) + bag_score         
-    avg_score = bag_score / len(test_df)
-    
-    return total_loss / len(test_df), avg_score, auc_value, thresholds_optimal
-
-def multi_label_roc(labels, predictions, num_classes, pos_label=1):
-    fprs = []
-    tprs = []
-    thresholds = []
-    thresholds_optimal = []
-    aucs = []
-    if len(predictions.shape)==1:
-        predictions = predictions[:, None]
-    for c in range(0, num_classes):
-        label = labels[:, c]
-        prediction = predictions[:, c]
-        fpr, tpr, threshold = roc_curve(label, prediction, pos_label=1)
-        fpr_optimal, tpr_optimal, threshold_optimal = optimal_thresh(fpr, tpr, threshold)
-        c_auc = roc_auc_score(label, prediction)
-        aucs.append(c_auc)
-        thresholds.append(threshold)
-        thresholds_optimal.append(threshold_optimal)
-    return aucs, thresholds, thresholds_optimal
-
-def optimal_thresh(fpr, tpr, thresholds, p=0):
-    loss = (fpr - tpr) - p * tpr / (fpr + tpr + 1)
-    idx = np.argmin(loss, axis=0)
-    return fpr[idx], tpr[idx], thresholds[idx]
+    test_labels = np.array(test_labels).ravel()
+    test_predictions = np.array(test_predictions).ravel()
+    auc = roc_auc_score(test_labels, test_predictions, average='macro', multi_class='ovr')
+    precision, recall, f1, _ = precision_recall_fscore_support(test_labels, test_predictions>=0.5, average='macro')
+    acc = accuracy_score(test_labels, test_predictions>=0.5)
+    results = {}
+    results["auc"] = auc
+    results["acc"] = acc
+    results["precision"] = precision
+    results["recall"] = recall
+    results["f1"] = f1
+    results["loss"] = total_loss / len(test_df)
+    return results
 
 def main():
     parser = argparse.ArgumentParser(description='Train DSMIL on 20x patch features learned by SimCLR')
     parser.add_argument('--num_classes', default=2, type=int, help='Number of output classes [2]')
-    parser.add_argument('--feats_size', default=512, type=int, help='Dimension of the feature size [512]')
+    parser.add_argument('--feats_size', default=1024, type=int, help='Dimension of the feature size [512]')
     parser.add_argument('--lr', default=0.0002, type=float, help='Initial learning rate [0.0002]')
     parser.add_argument('--num_epochs', default=200, type=int, help='Number of total training epochs [40|200]')
     parser.add_argument('--gpu_index', type=int, nargs='+', default=(0,), help='GPU ID(s) [0]')
@@ -147,6 +111,13 @@ def main():
     parser.add_argument('--dropout_node', default=0, type=float, help='Bag classifier dropout rate [0]')
     parser.add_argument('--non_linearity', default=1, type=float, help='Additional nonlinear operation [0]')
     parser.add_argument('--average', type=bool, default=True, help='Average the score of max-pooling and bag aggregating')
+    # unified dataset settings
+    parser.add_argument('--csv_path', default='', type=str)  # csv file to describe the data split
+    parser.add_argument('--feature_dir', default='', type=str)  # feature dir
+    parser.add_argument('--fold', default=1, type=int) # val fold
+    parser.add_argument('--nfolds', default=5, type=int) # number of folds
+    # save dir
+    parser.add_argument('--save_dir', default="logs") # number of folds
     args = parser.parse_args()
     gpu_ids = tuple(args.gpu_index)
     os.environ['CUDA_VISIBLE_DEVICES']=','.join(str(x) for x in gpu_ids)
@@ -172,41 +143,49 @@ def main():
     optimizer = torch.optim.Adam(milnet.parameters(), lr=args.lr, betas=(0.5, 0.9), weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.num_epochs, 0.000005)
     
-    if args.dataset == 'TCGA-lung-default':
-        bags_csv = 'datasets/tcga-dataset/TCGA.csv'
-    else:
-        bags_csv = os.path.join('datasets', args.dataset, args.dataset+'.csv')
-        
-    bags_path = pd.read_csv(bags_csv)
-    train_path = bags_path.iloc[0:int(len(bags_path)*(1-args.split)), :]
-    test_path = bags_path.iloc[int(len(bags_path)*(1-args.split)):, :]
+    train_set, val_set, test_set = [], [], []
+    train_folds = [i for i in range(1, args.nfolds+1)]
+    train_folds.remove(args.fold)
+    val_folds = [args.fold]
+    test_folds = [0]
+    with open(args.csv_path, "r") as f:
+        for row in f.readlines():
+            name, label, fold, path = row.strip().split(",")
+            if int(fold) in train_folds:
+                train_set.append([os.path.join(args.feature_dir, name+".npz"), int(label)])
+            elif int(fold) in val_folds:
+                val_set.append([os.path.join(args.feature_dir, name+".npz"), int(label)])
+            else:
+                test_set.append([os.path.join(args.feature_dir, name+".npz"), int(label)])
+    train_path = pd.DataFrame(train_set)
+    val_path = pd.DataFrame(val_set)
+    test_path = pd.DataFrame(test_set)
+
     best_score = 0
-    save_path = os.path.join('weights', datetime.date.today().strftime("%m%d%Y"))
-    os.makedirs(save_path, exist_ok=True)
-    run = len(glob.glob(os.path.join(save_path, '*.pth')))
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    log_file = open(os.path.join(args.save_dir, "log.txt"), 'a')
+    print_log(json.dumps(vars(args).copy()), log_file)
+
     for epoch in range(1, args.num_epochs):
         train_path = shuffle(train_path).reset_index(drop=True)
-        test_path = shuffle(test_path).reset_index(drop=True)
+        val_path = shuffle(val_path).reset_index(drop=True)
         train_loss_bag = train(train_path, milnet, criterion, optimizer, args) # iterate all bags
-        test_loss_bag, avg_score, aucs, thresholds_optimal = test(test_path, milnet, criterion, args)
-        if args.dataset.startswith('TCGA-lung'):
-            print('\r Epoch [%d/%d] train loss: %.4f test loss: %.4f, average score: %.4f, auc_LUAD: %.4f, auc_LUSC: %.4f' % 
-                  (epoch, args.num_epochs, train_loss_bag, test_loss_bag, avg_score, aucs[0], aucs[1]))
-        else:
-            print('\r Epoch [%d/%d] train loss: %.4f test loss: %.4f, average score: %.4f, AUC: ' % 
-                  (epoch, args.num_epochs, train_loss_bag, test_loss_bag, avg_score) + '|'.join('class-{}>>{}'.format(*k) for k in enumerate(aucs))) 
+        metrics = test(val_path, milnet, criterion, args)
+        print_log('\r Epoch [%d/%d] train loss: %.4f test loss: %.4f, ACC: %.4f, AUC: %.4f' % 
+                (epoch, args.num_epochs, train_loss_bag, metrics["loss"], metrics["acc"], metrics["auc"]), log_file) 
         scheduler.step()
-        current_score = (sum(aucs) + avg_score)/2
+        current_score = (metrics["acc"] + metrics["auc"])/2
         if current_score >= best_score:
             best_score = current_score
-            save_name = os.path.join(save_path, str(run+1)+'.pth')
+            save_name = os.path.join(args.save_dir, 'best.pth')
             torch.save(milnet.state_dict(), save_name)
-            if args.dataset.startswith('TCGA-lung'):
-                print('Best model saved at: ' + save_name + ' Best thresholds: LUAD %.4f, LUSC %.4f' % (thresholds_optimal[0], thresholds_optimal[1]))
-            else:
-                print('Best model saved at: ' + save_name)
-                print('Best thresholds ===>>> '+ '|'.join('class-{}>>{}'.format(*k) for k in enumerate(thresholds_optimal)))
-            
+            print_log('Best model saved at: ' + save_name, log_file)
+
+    metrics = test(val_path, milnet, criterion, args)
+    print_log("val : " + ", ".join("{}:{:.6f}".format(key, value) for key, value in metrics.items()), log_file)
+    metrics = test(test_path, milnet, criterion, args)
+    print_log("test : " + ", ".join("{}:{:.6f}".format(key, value) for key, value in metrics.items()), log_file)
 
 if __name__ == '__main__':
     main()
