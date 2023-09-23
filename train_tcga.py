@@ -182,6 +182,8 @@ def main():
             torch.save(milnet.state_dict(), save_name)
             print_log('Best model saved at: ' + save_name, log_file)
 
+    state_dict_weights = torch.load(os.path.join(args.save_dir, 'best.pth'))
+    milnet.load_state_dict(state_dict_weights, strict=True)
     metrics = test(val_path, milnet, criterion, args)
     print_log("val : " + ", ".join("{}:{:.6f}".format(key, value) for key, value in metrics.items()), log_file)
     metrics = test(test_path, milnet, criterion, args)
