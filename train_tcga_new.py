@@ -14,6 +14,40 @@ from sklearn.datasets import load_svmlight_file
 from collections import OrderedDict
 import json
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support, accuracy_score, roc_curve
+from torch.utils.tensorboard import SummaryWriter
+import random
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, length=0):
+        self.length = length
+        self.reset()
+
+    def reset(self):
+        if self.length > 0:
+            self.history = []
+        else:
+            self.count = 0
+            self.sum = 0.0
+        self.val = 0.0
+        self.avg = 0.0
+
+    def update(self, val, num=1):
+        if self.length > 0:
+            # currently assert num==1 to avoid bad usage, refine when there are some explict requirements
+            assert num == 1
+            self.history.append(val)
+            if len(self.history) > self.length:
+                del self.history[0]
+
+            self.val = self.history[-1]
+            self.avg = np.mean(self.history)
+        else:
+            self.val = val
+            self.sum += val * num
+            self.count += num
+            self.avg = self.sum / self.count
 
 def print_log(tstr, f):
     f.write('\n')
@@ -21,65 +55,69 @@ def print_log(tstr, f):
     f.flush()
     print(tstr)
 
-def get_bag_feats(csv_file_df, args): # modify for unified dataset
-    feature = np.load(csv_file_df.iloc[0])["features"]
-    label = int(csv_file_df.iloc[1])
-    return np.array([label]), feature
+def set_random_seed(seed, deterministic=False):
+    """Set random seed."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-def train(train_df, milnet, criterion, optimizer, args):
+def get_bag_feats(csv_file_df, shuffle=False): # modify for unified dataset
+    feature = np.load(csv_file_df.iloc[0])["features"]
+    if shuffle:
+        feature = feature[np.random.permutation(len(feature))]
+    label = int(csv_file_df.iloc[1])
+    return torch.from_numpy(np.array([[label]])).cuda().float(),  torch.from_numpy(feature).cuda().float()
+
+def train(train_df, milnet, criterion, optimizer, args, meters, tb, epoch):
     milnet.train()
     total_loss = 0
-    bc = 0
-    Tensor = torch.cuda.FloatTensor
     for i in range(len(train_df)):
         optimizer.zero_grad()
-        label, feats = get_bag_feats(train_df.iloc[i], args)
-        feats = dropout_patches(feats, args.dropout_patch)
-        bag_label = torch.from_numpy(label).cuda().float()
-        bag_feats = torch.from_numpy(feats).cuda().float()
-        bag_feats = bag_feats.view(-1, args.feats_size)
+        bag_label, bag_feats = get_bag_feats(train_df.iloc[i], shuffle=True)
         ins_prediction, bag_prediction, _, _ = milnet(bag_feats)
-        max_prediction, _ = torch.max(ins_prediction, 0)        
-        bag_loss = criterion(bag_prediction.view(1, -1), bag_label.view(1, -1))
-        max_loss = criterion(max_prediction.view(1, -1), bag_label.view(1, -1))
+        max_prediction, _ = torch.max(ins_prediction, 0, keepdim=True)        
+        bag_loss = criterion(bag_prediction, bag_label)
+        max_loss = criterion(max_prediction, bag_label)
         loss = 0.5*bag_loss + 0.5*max_loss
         loss.backward()
         optimizer.step()
         total_loss = total_loss + loss.item()
+        meters["loss"].update(loss.item())
+        meters["bag_loss"].update(bag_loss.item())
+        meters["max_loss"].update(max_loss.item())
+        step = epoch * len(train_df) + i+1
+        tb.add_scalar("train/loss", meters["loss"].avg, step)
+        tb.add_scalar("train/bag_loss", meters["bag_loss"].avg, step)
+        tb.add_scalar("train/max_loss", meters["max_loss"].avg, step)
+        tb.add_scalar("train/lr", optimizer.param_groups[0]['lr'], step)
         sys.stdout.write('\r Training bag [%d/%d] bag loss: %.4f' % (i, len(train_df), loss.item()))
     return total_loss / len(train_df)
-
-def dropout_patches(feats, p):
-    idx = np.random.choice(np.arange(feats.shape[0]), int(feats.shape[0]*(1-p)), replace=False)
-    sampled_feats = np.take(feats, idx, axis=0)
-    pad_idx = np.random.choice(np.arange(sampled_feats.shape[0]), int(feats.shape[0]*p), replace=False)
-    pad_feats = np.take(sampled_feats, pad_idx, axis=0)
-    sampled_feats = np.concatenate((sampled_feats, pad_feats), axis=0)
-    return sampled_feats
 
 def test(test_df, milnet, criterion, args): # modified for unified eval metrics
     milnet.eval()
     total_loss = 0
     test_labels = []
     test_predictions = []
-    Tensor = torch.cuda.FloatTensor
     with torch.no_grad():
         for i in range(len(test_df)):
-            label, feats = get_bag_feats(test_df.iloc[i], args)
-            bag_label = torch.from_numpy(label).cuda().float()
-            bag_feats = torch.from_numpy(feats).cuda().float()
-            bag_feats = bag_feats.view(-1, args.feats_size)
+            bag_label, bag_feats = get_bag_feats(test_df.iloc[i])
             ins_prediction, bag_prediction, _, _ = milnet(bag_feats)
-            max_prediction, _ = torch.max(ins_prediction, 0)  
-            bag_loss = criterion(bag_prediction.view(1, -1), bag_label.view(1, -1))
-            max_loss = criterion(max_prediction.view(1, -1), bag_label.view(1, -1))
+            max_prediction, _ = torch.max(ins_prediction, 0, keepdim=True)  
+            bag_loss = criterion(bag_prediction, bag_label)
+            max_loss = criterion(max_prediction, bag_label)
             loss = 0.5*bag_loss + 0.5*max_loss
             total_loss = total_loss + loss.item()
             sys.stdout.write('\r Testing bag [%d/%d] bag loss: %.4f' % (i, len(test_df), loss.item()))
-            test_labels.extend([label])
+            test_labels.extend([bag_label[0][0].item()])
             if args.average:
                 test_predictions.extend([(0.5*torch.sigmoid(max_prediction)+0.5*torch.sigmoid(bag_prediction)).squeeze().cpu().numpy()])
-            else: test_predictions.extend([(0.0*torch.sigmoid(max_prediction)+1.0*torch.sigmoid(bag_prediction)).squeeze().cpu().numpy()])
+            else: 
+                test_predictions.extend([(0.0*torch.sigmoid(max_prediction)+1.0*torch.sigmoid(bag_prediction)).squeeze().cpu().numpy()])
     test_labels = np.array(test_labels).ravel()
     test_predictions = np.array(test_predictions).ravel()
     print(test_labels)
@@ -109,8 +147,8 @@ def main():
     parser.add_argument('--model', default='dsmil', type=str, help='MIL model [dsmil]')
     parser.add_argument('--dropout_patch', default=0, type=float, help='Patch dropout rate [0]')
     parser.add_argument('--dropout_node', default=0, type=float, help='Bag classifier dropout rate [0]')
-    parser.add_argument('--non_linearity', default=1, type=float, help='Additional nonlinear operation [0]')
-    parser.add_argument('--average', type=bool, default=True, help='Average the score of max-pooling and bag aggregating')
+    parser.add_argument('--non_linearity', action="store_true", help='Additional nonlinear operation [0]')
+    parser.add_argument('--average', action="store_true", help='Average the score of max-pooling and bag aggregating')
     # unified dataset settings
     parser.add_argument('--csv_path', default='', type=str)  # csv file to describe the data split
     parser.add_argument('--feature_dir', default='', type=str)  # feature dir
@@ -121,6 +159,7 @@ def main():
     args = parser.parse_args()
     gpu_ids = tuple(args.gpu_index)
     # os.environ['CUDA_VISIBLE_DEVICES']=','.join(str(x) for x in gpu_ids)
+    set_random_seed(2023, True)
     
     if args.model == 'dsmil':
         import dsmil as mil
@@ -134,12 +173,6 @@ def main():
         state_dict_weights = torch.load('init.pth')
         info = milnet.load_state_dict(state_dict_weights, strict=False)
         print(info)
-        # try:
-        #     milnet.load_state_dict(state_dict_weights, strict=False)
-        # except:
-        #     del state_dict_weights['b_classifier.v.1.weight']
-        #     del state_dict_weights['b_classifier.v.1.bias']
-        #     milnet.load_state_dict(state_dict_weights, strict=False)
     criterion = nn.BCEWithLogitsLoss()
     
     optimizer = torch.optim.Adam(milnet.parameters(), lr=args.lr, betas=(0.5, 0.9), weight_decay=args.weight_decay)
@@ -168,16 +201,22 @@ def main():
 
     log_file = open(os.path.join(args.save_dir, "log.txt"), 'a')
     print_log(json.dumps(vars(args).copy()), log_file)
+    tb = SummaryWriter(args.save_dir)
+    meters = {"loss":AverageMeter(20), "bag_loss":AverageMeter(20), "max_loss":AverageMeter(20)}
 
     for epoch in range(1, args.num_epochs):
         train_path = shuffle(train_path).reset_index(drop=True)
-        # val_path = shuffle(val_path).reset_index(drop=True)
-        train_loss_bag = train(train_path, milnet, criterion, optimizer, args) # iterate all bags
+        val_path = shuffle(val_path).reset_index(drop=True)
+        train_loss_bag = train(train_path, milnet, criterion, optimizer, args, meters, tb, epoch) # iterate all bags
         metrics = test(val_path, milnet, criterion, args)
         print_log('\r Epoch [%d/%d] train loss: %.4f test loss: %.4f, ACC: %.4f, AUC: %.4f' % 
                 (epoch, args.num_epochs, train_loss_bag, metrics["loss"], metrics["acc"], metrics["auc"]), log_file) 
         scheduler.step()
         current_score = (metrics["acc"] + metrics["auc"])/2
+        tb.add_scalar("val/loss", metrics["loss"], epoch*len(train_path))
+        tb.add_scalar("val/acc", metrics["acc"], epoch*len(train_path))
+        tb.add_scalar("val/auc", metrics["auc"], epoch*len(train_path))
+        tb.add_scalar("val/mean", current_score, epoch*len(train_path))
         if current_score >= best_score:
             best_score = current_score
             save_name = os.path.join(args.save_dir, 'best.pth')
